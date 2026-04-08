@@ -1,10 +1,3 @@
-"""
-Minimal FIFO baseline plugin for libCacheSim Python hooks.
-
-This file is intentionally simple and uses the same CLI arguments as
-plugins/plugin_competition.py for direct miss-ratio comparison.
-"""
-
 from __future__ import annotations
 
 from collections import OrderedDict
