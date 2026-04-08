@@ -191,13 +191,17 @@ def cache_free_hook(data: Competition2QGhost) -> None:
 
 def _parse_size(size_text: str) -> int:
     s = size_text.strip().lower()
-    units = {
-        "b": 1,
-        "kb": 1024,
-        "mb": 1024**2,
-        "gb": 1024**3,
-    }
-    for u, mult in units.items():
+    # Match longer suffixes first so "64mb" does not get parsed as "64m" + "b".
+    units = [
+        ("gb", 1024**3),
+        ("g", 1024**3),
+        ("mb", 1024**2),
+        ("m", 1024**2),
+        ("kb", 1024),
+        ("k", 1024),
+        ("b", 1),
+    ]
+    for u, mult in units:
         if s.endswith(u):
             num = float(s[: -len(u)] or "0")
             return int(num * mult)
