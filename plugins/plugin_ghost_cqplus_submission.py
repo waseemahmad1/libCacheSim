@@ -136,24 +136,33 @@ class GhostCQPlus:
         if obj_size > self.cache_size:
             return
 
-        # Gentle adaptation using ghost hits.
-        delta = max(obj_size, int(self.cache_size * 0.01))
+        # Gentle adaptation using ghost hits (stabilized for larger caches).
+        delta = max(obj_size, int(self.cache_size * 0.002))
+        is_ghost_hit = False
 
         if obj_id in self.ghost_S:
-            self.p_target_bytes = min(int(self.cache_size * 0.40), self.p_target_bytes + delta)
+            # Expanded upper bound for scan-heavy phases.
+            self.p_target_bytes = min(int(self.cache_size * 0.50), self.p_target_bytes + delta)
             self.ghost_S_size -= self.ghost_S[obj_id]
             del self.ghost_S[obj_id]
+            is_ghost_hit = True
         elif obj_id in self.ghost_M:
             self.p_target_bytes = max(int(self.cache_size * 0.05), self.p_target_bytes - delta)
             self.ghost_M_size -= self.ghost_M[obj_id]
             del self.ghost_M[obj_id]
+            is_ghost_hit = True
 
-        # Admit new item into probation.
+        # Admit new item: ghost re-references bypass probation.
         node = Node(obj_id, obj_size)
-        node.q_type = "probation"
-        self._link_head(self.p_head, node)
+        if is_ghost_hit:
+            node.q_type = "protected"
+            self._link_head(self.m_head, node)
+            self.m_size_bytes += obj_size
+        else:
+            node.q_type = "probation"
+            self._link_head(self.p_head, node)
+            self.p_size_bytes += obj_size
         self.mapping[obj_id] = node
-        self.p_size_bytes += obj_size
 
     def pick_victim(self, req: Request) -> int:
         _ = req
