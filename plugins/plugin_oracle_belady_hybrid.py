@@ -81,6 +81,7 @@ class OracleBeladyHybrid:
                 and self.oracle_nonneg_seen >= self.cfg.oracle_enable_threshold
             ):
                 self.oracle_mode = True
+                print("SWITCHED TO ORACLE MODE")
                 self._rebuild_oracle_heap()
             return nv
 
