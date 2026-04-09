@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from math import log, sqrt
 from typing import Optional
 
 from libcachesim import CommonCacheParams, Request
@@ -7,48 +8,36 @@ from libcachesim import CommonCacheParams, Request
 class PolicyConfig:
     def __init__(
         self,
-        init_probation_frac: float = 0.24,
-        min_probation_frac: float = 0.10,
-        max_probation_frac: float = 0.60,
+        probation_frac_arms=(0.12, 0.18, 0.24, 0.32, 0.42, 0.52),
         adapt_every: int = 2048,
         short_gap_epochs: int = 2,
         ghost_factor: int = 6,
         min_ghost_entries: int = 4096,
         max_ghost_entries: int = 500000,
+        ucb_c: float = 0.18,
+        reward_ema_alpha: float = 0.25,
     ):
-        self.init_probation_frac = init_probation_frac
-        self.min_probation_frac = min_probation_frac    
-        self.max_probation_frac = max_probation_frac
+        self.probation_frac_arms = probation_frac_arms
         self.adapt_every = adapt_every
         self.short_gap_epochs = short_gap_epochs
         self.ghost_factor = ghost_factor
         self.min_ghost_entries = min_ghost_entries
         self.max_ghost_entries = max_ghost_entries
+        self.ucb_c = ucb_c
+        self.reward_ema_alpha = reward_ema_alpha
 
 
-class PhaseShiftCompact:
-    """
-    Compact adaptive FIFO hybrid:
-    - probation FIFO for new objects
-    - protected FIFO for proven reuse
-    - ghost FIFO for adaptation feedback
-
-    Design choices:
-    - promotion only on probation hits (not on eviction scans)
-    - ghost hits re-enter probation with a warm bit, not direct protected admission
-    - adaptation uses one primary outcome signal:
-      ghost-from-probation pressure vs protected-hit yield
-    """
+class SelfTuningS3Sieve:
 
     def __init__(self, cache_size: int, cfg: Optional[PolicyConfig] = None):
         self.cfg = cfg or PolicyConfig()
         self.cache_size = int(cache_size)
 
-        # probation: obj_id -> [size, refbit, last_epoch]
+        # obj_id -> [size, refbit, last_epoch, ghost_mark]
         self.probation = OrderedDict()
-        # protected: obj_id -> [size, refbit]
+        # obj_id -> [size, refbit]
         self.protected = OrderedDict()
-        # ghost: obj_id -> origin ('P' or 'R')
+        # obj_id -> origin ('P' or 'R')
         self.ghost = OrderedDict()
 
         self.probation_bytes = 0
@@ -57,51 +46,93 @@ class PhaseShiftCompact:
         self.req_count = 0
         self.epoch = 0
 
-        self.probation_target = self._clamp_probation_target(
-            int(self.cache_size * self.cfg.init_probation_frac)
-        )
-        self.adapt_step = max(1, self.cache_size // 40)
-
         ghost_cap = self.cache_size * self.cfg.ghost_factor
         self.ghost_limit = max(
             self.cfg.min_ghost_entries, min(self.cfg.max_ghost_entries, ghost_cap)
         )
 
-        # Short rolling signals.
+        self.frac_arms = tuple(self.cfg.probation_frac_arms)
+        self.n_arms = len(self.frac_arms)
+        self.arm_pulls = [0] * self.n_arms
+        self.arm_value = [0.0] * self.n_arms
+        self.arm_idx = min(2, self.n_arms - 1)  # start near moderate probation
+        self.total_adapt_rounds = 0
+
+        self.probation_target = self._target_from_arm(self.arm_idx)
+        self.target_step = max(1, self.cache_size // 50)
+
+        # Short-window stats for reward/adaptation.
+        self.win_hit_probation = 0
         self.win_hit_protected = 0
+        self.win_miss = 0
         self.win_ghost_from_probation = 0
         self.win_ghost_from_protected = 0
+        self.scan_mode = False
 
-    def _clamp_probation_target(self, x: int) -> int:
-        lo = max(1, int(self.cache_size * self.cfg.min_probation_frac))
-        hi = max(lo, int(self.cache_size * self.cfg.max_probation_frac))
-        return min(hi, max(lo, x))
+    def _target_from_arm(self, idx: int) -> int:
+        frac = self.frac_arms[idx]
+        lo = max(1, int(self.cache_size * min(self.frac_arms)))
+        hi = max(lo, int(self.cache_size * max(self.frac_arms)))
+        val = int(self.cache_size * frac)
+        return min(hi, max(lo, val))
 
     def _tick(self) -> None:
         self.req_count += 1
         if (self.req_count & 127) == 0:
             self.epoch += 1
         if self.req_count % self.cfg.adapt_every == 0:
-            self._adapt()
+            self._adapt_bandit()
 
-    def _adapt(self) -> None:
-        delta = 0
-        # If many probation evictees come back, probation is too small.
-        if self.win_ghost_from_probation > self.win_hit_protected + 2:
-            delta += 1
-        # If protected is producing strong hits, give it more room.
-        if self.win_hit_protected > self.win_ghost_from_probation + 6:
-            delta -= 1
-        # If ghost says protected evictions also come back, bias to larger probation.
-        if self.win_ghost_from_protected > self.win_hit_protected + 4:
-            delta += 1
+    def _adapt_bandit(self) -> None:
+        # Compute reward of current arm from short-window outcomes.
+        # Emphasize protected hits; penalize misses and probation-ghost pressure.
+        reward = (
+            2.0 * self.win_hit_protected
+            + 0.8 * self.win_hit_probation
+            - 1.6 * self.win_miss
+            - 1.2 * self.win_ghost_from_probation
+            - 0.4 * self.win_ghost_from_protected
+        ) / float(max(1, self.cfg.adapt_every))
 
-        if delta != 0:
-            self.probation_target = self._clamp_probation_target(
-                self.probation_target + delta * self.adapt_step
+        i = self.arm_idx
+        self.arm_pulls[i] += 1
+        a = self.cfg.reward_ema_alpha
+        self.arm_value[i] = (1.0 - a) * self.arm_value[i] + a * reward
+
+        self.total_adapt_rounds += 1
+
+        # Fast scan signal for admission placement.
+        hits = self.win_hit_probation + self.win_hit_protected
+        self.scan_mode = self.win_miss > (hits * 3 + 64)
+
+        # Explore each arm at least once, then UCB selection.
+        if self.total_adapt_rounds < self.n_arms:
+            self.arm_idx = self.total_adapt_rounds
+        else:
+            log_term = log(float(self.total_adapt_rounds) + 1.0)
+            best_idx = 0
+            best_score = -1e18
+            for j in range(self.n_arms):
+                pulls = self.arm_pulls[j]
+                # Small positive denominator avoids division-by-zero.
+                bonus = self.cfg.ucb_c * sqrt(log_term / (pulls + 1e-9))
+                score = self.arm_value[j] + bonus
+                if score > best_score:
+                    best_score = score
+                    best_idx = j
+            self.arm_idx = best_idx
+
+        # Apply selected target; small scan-time nudge toward larger probation.
+        self.probation_target = self._target_from_arm(self.arm_idx)
+        if self.scan_mode:
+            self.probation_target = min(
+                self.cache_size - 1, self.probation_target + self.target_step
             )
 
+        # Reset window counters.
+        self.win_hit_probation = 0
         self.win_hit_protected = 0
+        self.win_miss = 0
         self.win_ghost_from_probation = 0
         self.win_ghost_from_protected = 0
 
@@ -120,9 +151,14 @@ class PhaseShiftCompact:
         if rec is not None:
             self.protected_bytes -= rec[0]
 
-    def _add_probation(self, obj_id: int, obj_size: int, refbit: int) -> None:
+    def _add_probation(
+        self, obj_id: int, obj_size: int, refbit: int, ghost_mark: int, near_head: bool
+    ) -> None:
         self._remove_obj(obj_id)
-        self.probation[obj_id] = [obj_size, refbit, self.epoch]
+        self.probation[obj_id] = [obj_size, refbit, self.epoch, ghost_mark]
+        if near_head:
+            # In scan phases, put new items closer to eviction edge.
+            self.probation.move_to_end(obj_id, last=False)
         self.probation_bytes += obj_size
 
     def _add_protected(self, obj_id: int, obj_size: int, refbit: int) -> None:
@@ -136,16 +172,18 @@ class PhaseShiftCompact:
 
         rec = self.probation.get(obj_id)
         if rec is not None:
-            obj_size, refbit, last_epoch = rec
+            self.win_hit_probation += 1
+            obj_size, refbit, last_epoch, ghost_mark = rec
             short_gap = (self.epoch - last_epoch) <= self.cfg.short_gap_epochs
-            # Promote only on clear evidence of quick reuse.
-            if short_gap or refbit == 1:
+            # Promote only on clear quick reuse evidence.
+            if short_gap and (ghost_mark == 1 or refbit == 1):
                 self.probation.pop(obj_id, None)
                 self.probation_bytes -= obj_size
                 self._add_protected(obj_id, obj_size, 1)
             else:
                 rec[1] = 1
                 rec[2] = self.epoch
+                rec[3] = 0
             return
 
         rec = self.protected.get(obj_id)
@@ -161,6 +199,8 @@ class PhaseShiftCompact:
 
     def on_miss(self, req: Request) -> None:
         self._tick()
+        self.win_miss += 1
+
         obj_id = int(req.obj_id)
         obj_size = int(req.obj_size)
         if obj_size > self.cache_size:
@@ -174,12 +214,12 @@ class PhaseShiftCompact:
                 self.win_ghost_from_probation += 1
             else:
                 self.win_ghost_from_protected += 1
-            # Conditional ghost handling: warm probation, not direct protected.
-            self._add_probation(obj_id, obj_size, 1)
+            # Ghost hits re-enter probation warm; no direct protected admission.
+            self._add_probation(obj_id, obj_size, 1, 1, near_head=False)
             return
 
-        # First touch enters probation cold.
-        self._add_probation(obj_id, obj_size, 0)
+        near_head = self.scan_mode and self.probation_bytes >= self.probation_target
+        self._add_probation(obj_id, obj_size, 0, 0, near_head=near_head)
 
     def _evict_from_probation(self) -> Optional[int]:
         if not self.probation:
@@ -188,18 +228,18 @@ class PhaseShiftCompact:
         n = len(self.probation)
         for _ in range(n):
             obj_id, rec = self.probation.popitem(last=False)
-            obj_size, refbit, _last_epoch = rec
+            obj_size, refbit, _last_epoch, _ghost_mark = rec
             self.probation_bytes -= obj_size
 
             if refbit == 0:
                 self._ghost_add(obj_id, "P")
                 return obj_id
 
-            # Quick demotion bias: give exactly one extra turn in probation.
-            self.probation[obj_id] = [obj_size, 0, self.epoch]
+            # One simple second chance in-place, then cold again.
+            self.probation[obj_id] = [obj_size, 0, self.epoch, 0]
             self.probation_bytes += obj_size
 
-        # Guaranteed progress.
+        # Guarantee progress.
         obj_id, rec = self.probation.popitem(last=False)
         self.probation_bytes -= rec[0]
         self._ghost_add(obj_id, "P")
@@ -219,11 +259,10 @@ class PhaseShiftCompact:
                 self._ghost_add(obj_id, "R")
                 return obj_id
 
-            # One second chance, then become cold.
             self.protected[obj_id] = [obj_size, 0]
             self.protected_bytes += obj_size
 
-        # Guaranteed progress.
+        # Guarantee progress.
         obj_id, rec = self.protected.popitem(last=False)
         self.protected_bytes -= rec[0]
         self._ghost_add(obj_id, "R")
@@ -232,9 +271,17 @@ class PhaseShiftCompact:
     def pick_victim(self, req: Request) -> int:
         _ = req
 
-        # Hard bias toward quick probation cleanup for scan resistance.
+        protected_target = max(1, self.cache_size - self.probation_target)
+
+        # If protected exceeds target by a lot, pressure protected first.
+        if self.protected and self.protected_bytes > (protected_target + self.target_step):
+            victim = self._evict_from_protected()
+            if victim is not None:
+                return victim
+
+        # Default: clear probation first for scan resistance.
         if self.probation and (
-            self.probation_bytes > self.probation_target or self.protected_bytes == 0
+            self.probation_bytes > self.probation_target or not self.protected
         ):
             victim = self._evict_from_probation()
             if victim is not None:
@@ -262,25 +309,25 @@ class PhaseShiftCompact:
         self.protected_bytes = 0
 
 
-def init_hook(common_cache_params: CommonCacheParams) -> PhaseShiftCompact:
-    return PhaseShiftCompact(cache_size=int(common_cache_params.cache_size))
+def init_hook(common_cache_params: CommonCacheParams) -> SelfTuningS3Sieve:
+    return SelfTuningS3Sieve(cache_size=int(common_cache_params.cache_size))
 
 
-def hit_hook(data: PhaseShiftCompact, req: Request) -> None:
+def hit_hook(data: SelfTuningS3Sieve, req: Request) -> None:
     data.on_hit(req)
 
 
-def miss_hook(data: PhaseShiftCompact, req: Request) -> None:
+def miss_hook(data: SelfTuningS3Sieve, req: Request) -> None:
     data.on_miss(req)
 
 
-def eviction_hook(data: PhaseShiftCompact, req: Request) -> int:
+def eviction_hook(data: SelfTuningS3Sieve, req: Request) -> int:
     return data.pick_victim(req)
 
 
-def remove_hook(data: PhaseShiftCompact, obj_id: int) -> None:
+def remove_hook(data: SelfTuningS3Sieve, obj_id: int) -> None:
     data.on_remove(obj_id)
 
 
-def free_hook(data: PhaseShiftCompact) -> None:
+def free_hook(data: SelfTuningS3Sieve) -> None:
     data.on_free()
