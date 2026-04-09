@@ -59,6 +59,15 @@ class OracleBeladyHybrid:
         self.max_next_heap = []
 
     def _next_from_req(self, req: Request) -> int:
+
+        if (
+            not self.oracle_mode
+            and self.oracle_nonneg_seen >= self.cfg.oracle_enable_threshold
+    ):
+            self.oracle_mode = True
+            print("SWITCHED TO ORACLE MODE")
+            self._rebuild_oracle_heap()
+    
         nv = getattr(req, "next_access_vtime", -1)
         try:
             nv = int(nv)
