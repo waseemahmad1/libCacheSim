@@ -7,7 +7,7 @@ from libcachesim import CommonCacheParams, Request
 class PolicyConfig:
     def __init__(
         self,
-        small_fraction: float = 0.10,
+        small_fraction: float = 0.20,
         min_small_bytes: int = 16,
         ghost_factor: int = 4,
         min_ghost_entries: int = 2048,
